@@ -869,9 +869,9 @@ static struct ggml_backend_buffer * ggml_backend_metal_alloc_buffer(struct ggml_
     struct ggml_metal_buffer_wrapper * wrapper = malloc(sizeof(struct ggml_metal_buffer_wrapper));
     wrapper->buffer = [ctx_metal->device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
-    printf("XXXXXXXXXXXXXXX ALOC: %p %p\n", (void * )wrapper, (void *)&wrapper->buffer);
+    //printf("XXXXXXXXXXXXXXX ALOC: %p %p %p\n", (void * )wrapper, (void *)&wrapper->buffer, (void *)[wrapper->buffer contents]);
 
-    struct ggml_backend_buffer * buffer = ggml_allocator_simple_init(wrapper, size, TENSOR_ALIGNMENT);
+    struct ggml_backend_buffer * buffer = ggml_allocator_simple_init([wrapper->buffer contents], size, TENSOR_ALIGNMENT);
     buffer->interface.free_data = ggml_backend_metal_free_buffer;
     buffer->backend_data = wrapper; // GG: why assign to backend_data? Can't we do it in the allocator?
 
@@ -882,13 +882,9 @@ static void ggml_backend_metal_set_tensor_async(struct ggml_backend * backend, s
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
-    struct ggml_backend_buffer * bb = (struct ggml_backend_buffer *)tensor->data;
-    struct ggml_metal_buffer_wrapper * wrapper = (struct ggml_metal_buffer_wrapper *)bb->backend_data;
+    //printf("XXXXXXXXXXXXXXX SET : %p %p\n", (void *)(tensor->data), (void *)wrapper);
 
-    printf("XXXXXXXXXXXXXXX SET : %p\n", (void *)wrapper);
-
-    char * contents = [wrapper->buffer contents];
-    memcpy((char *)contents + offset, data, size);
+    memcpy((char *)tensor->data, data, size);
 
     UNUSED(backend);
 }
@@ -897,12 +893,9 @@ static void ggml_backend_metal_get_tensor_async(struct ggml_backend * backend, c
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
-    struct ggml_metal_buffer_wrapper * wrapper = (struct ggml_metal_buffer_wrapper *)data;
+    //printf("XXXXXXXXXXXXXXX GET : %p\n", (void *)wrapper);
 
-    printf("XXXXXXXXXXXXXXX GET : %p\n", (void *)wrapper);
-
-    char * contents = [wrapper->buffer contents];
-    memcpy(contents, (const char *)tensor->data + offset, size);
+    memcpy(data, (const char *)tensor->data + offset, size);
 
     UNUSED(backend);
 }

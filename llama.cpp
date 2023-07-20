@@ -657,7 +657,6 @@ struct llama_model_loader {
             }
             LLAMA_ASSERT(lt.ggml_tensor); // unused tensors should have been caught by load_data already
 
-            printf("loading '%s'\n", lt.name.c_str());
             const bool is_ram_shared = lt.ggml_tensor->backend->is_ram_shared;
 
             // select buffer to load data into
