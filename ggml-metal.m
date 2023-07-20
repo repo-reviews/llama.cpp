@@ -15,15 +15,6 @@
 
 #define UNUSED(x) (void)(x)
 
-struct ggml_metal_buffer {
-    const char * name;
-
-    void   * data;
-    size_t   size;
-
-    id<MTLBuffer> metal;
-};
-
 struct ggml_metal_context {
     int n_cb;
 
@@ -32,9 +23,6 @@ struct ggml_metal_context {
     id<MTLDevice>       device;
     id<MTLCommandQueue> queue;
     id<MTLLibrary>      library;
-
-    int n_buffers;
-    struct ggml_metal_buffer buffers[GGML_METAL_MAX_BUFFERS];
 
     // custom kernels
 #define GGML_METAL_DECL_KERNEL(name) \
@@ -96,7 +84,6 @@ struct ggml_metal_context * ggml_metal_init(int n_cb) {
     ctx->n_cb   = n_cb;
     ctx->device = MTLCreateSystemDefaultDevice();
     ctx->queue  = [ctx->device newCommandQueue];
-    ctx->n_buffers = 0;
 
     // determine if we can use MPS
     if (MPSSupportsMTLDevice(ctx->device)) {
@@ -205,153 +192,11 @@ struct ggml_metal_context * ggml_metal_init(int n_cb) {
 
 void ggml_metal_free(struct ggml_metal_context * ctx) {
     fprintf(stderr, "%s: deallocating\n", __func__);
-    for (int i = 0; i < ctx->n_buffers; ++i) {
-        [ctx->buffers[i].metal release];
-    }
     free(ctx);
 }
 
 void ggml_metal_set_n_cb(struct ggml_metal_context * ctx, int n_cb) {
     ctx->n_cb = n_cb;
-}
-
-// finds the Metal buffer that contains the tensor data on the GPU device
-// the assumption is that there is 1-to-1 mapping between the host and device memory buffers, so we can find the
-// Metal buffer based on the host memory pointer
-//
-static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, struct ggml_tensor * t, size_t * offs) {
-    //fprintf(stderr, "%s: data tensor '%16s', offs_data = %8ld, offs_eval = %8ld, offs_cach = %8ld\n", __func__, t->name, offs_data, offs_eval, offs_cach);
-
-    const int64_t tsize = ggml_nbytes(t);
-
-    // find the view that contains the tensor fully
-    for (int i = 0; i < ctx->n_buffers; ++i) {
-        const int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[i].data;
-
-        if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->buffers[i].size) {
-            *offs = (size_t) ioffs;
-
-            //fprintf(stderr, "%s: '%s' tensor '%16s', offs = %8ld\n", __func__, ctx->buffers[i].name, t->name, *offs);
-
-            return ctx->buffers[i].metal;
-        }
-    }
-
-    fprintf(stderr, "%s: error: buffer is nil for tensor '%s'\n", __func__, t->name);
-
-    return nil;
-}
-
-// TODO: rename to ggml_metal_map_buffer
-bool ggml_metal_add_buffer(
-        struct ggml_metal_context * ctx,
-                       const char * name,
-                             void * data,
-                           size_t   size,
-                           size_t   max_size) {
-    if (ctx->n_buffers >= GGML_METAL_MAX_BUFFERS) {
-        fprintf(stderr, "%s: too many buffers\n", __func__);
-        return false;
-    }
-
-    if (data) {
-        // verify that the buffer does not overlap with any of the existing buffers
-        for (int i = 0; i < ctx->n_buffers; ++i) {
-            const int64_t ioffs = (int64_t) data - (int64_t) ctx->buffers[i].data;
-
-            if (ioffs >= 0 && ioffs < (int64_t) ctx->buffers[i].size) {
-                fprintf(stderr, "%s: error: buffer '%s' overlaps with '%s'\n", __func__, name, ctx->buffers[i].name);
-                return false;
-            }
-        }
-
-        const size_t size_page = getpagesize();
-
-        size_t size_aligned = size;
-        if ((size_aligned % size_page) != 0) {
-            size_aligned += (size_page - (size_aligned % size_page));
-        }
-
-        // the buffer fits into the max buffer size allowed by the device
-        if (size_aligned <= ctx->device.maxBufferLength) {
-            ctx->buffers[ctx->n_buffers].name = name;
-            ctx->buffers[ctx->n_buffers].data = data;
-            ctx->buffers[ctx->n_buffers].size = size;
-
-            ctx->buffers[ctx->n_buffers].metal = [ctx->device newBufferWithBytesNoCopy:data length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
-
-            if (ctx->buffers[ctx->n_buffers].metal == nil) {
-                fprintf(stderr, "%s: failed to allocate '%-16s' buffer, size = %8.2f MB\n", __func__, name, size_aligned / 1024.0 / 1024.0);
-                return false;
-            }
-
-            fprintf(stderr, "%s: allocated '%-16s' buffer, size = %8.2f MB", __func__, name, size_aligned / 1024.0 / 1024.0);
-
-            ++ctx->n_buffers;
-        } else {
-            // this overlap between the views will guarantee that the tensor with the maximum size will fully fit into
-            // one of the views
-            const size_t size_ovlp = ((max_size + size_page - 1) / size_page + 1) * size_page; // round-up 2 pages just in case
-            const size_t size_step = ctx->device.maxBufferLength - size_ovlp;
-            const size_t size_view = ctx->device.maxBufferLength;
-
-            for (size_t i = 0; i < size; i += size_step) {
-                const size_t size_step_aligned = (i + size_view <= size) ? size_view : (size_aligned - i);
-
-                ctx->buffers[ctx->n_buffers].name = name;
-                ctx->buffers[ctx->n_buffers].data = (void *) ((uint8_t *) data + i);
-                ctx->buffers[ctx->n_buffers].size = size_step_aligned;
-
-                ctx->buffers[ctx->n_buffers].metal = [ctx->device newBufferWithBytesNoCopy:(void *) ((uint8_t *) data + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
-
-                if (ctx->buffers[ctx->n_buffers].metal == nil) {
-                    fprintf(stderr, "%s: failed to allocate '%-16s' buffer, size = %8.2f MB\n", __func__, name, size_step_aligned / 1024.0 / 1024.0);
-                    return false;
-                }
-
-                fprintf(stderr, "%s: allocated '%-16s' buffer, size = %8.2f MB, offs = %12ld", __func__, name, size_step_aligned / 1024.0 / 1024.0, i);
-                if (i + size_step < size) {
-                    fprintf(stderr, "\n");
-                }
-
-                ++ctx->n_buffers;
-            }
-        }
-
-        fprintf(stderr, ", (%8.2f / %8.2f)",
-                ctx->device.currentAllocatedSize / 1024.0 / 1024.0,
-                ctx->device.recommendedMaxWorkingSetSize / 1024.0 / 1024.0);
-
-        if (ctx->device.currentAllocatedSize > ctx->device.recommendedMaxWorkingSetSize) {
-            fprintf(stderr, ", warning: current allocated size is greater than the recommended max working set size\n");
-        } else {
-            fprintf(stderr, "\n");
-        }
-    }
-
-    return true;
-}
-
-void ggml_metal_set_tensor(
-        struct ggml_metal_context * ctx,
-        struct ggml_tensor * t) {
-    metal_printf("%s: set input for tensor '%s'\n", __func__, t->name);
-
-    size_t offs;
-    id<MTLBuffer> id_dst = ggml_metal_get_buffer(ctx, t, &offs);
-
-    memcpy((void *) ((uint8_t *) id_dst.contents + offs), t->data, ggml_nbytes(t));
-}
-
-void ggml_metal_get_tensor(
-        struct ggml_metal_context * ctx,
-        struct ggml_tensor * t) {
-    metal_printf("%s: extract results for tensor '%s'\n", __func__, t->name);
-
-    size_t offs;
-    id<MTLBuffer> id_src = ggml_metal_get_buffer(ctx, t, &offs);
-
-    memcpy(t->data, (void *) ((uint8_t *) id_src.contents + offs), ggml_nbytes(t));
 }
 
 void ggml_metal_graph_compute(
@@ -432,9 +277,9 @@ void ggml_metal_graph_compute(
                 const enum ggml_type src1t = src1 ? src1->type : GGML_TYPE_COUNT;
                 const enum ggml_type dstt  = dst  ? dst->type  : GGML_TYPE_COUNT;
 
-                id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(ctx, src0, &offs_src0) : nil;
-                id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(ctx, src1, &offs_src1) : nil;
-                id<MTLBuffer> id_dst  = dst  ? ggml_metal_get_buffer(ctx, dst,  &offs_dst)  : nil;
+                id<MTLBuffer> id_src0 = src0 ? src0->data : nil;
+                id<MTLBuffer> id_src1 = src1 ? src1->data : nil;
+                id<MTLBuffer> id_dst  = dst  ? dst->data  : nil;
 
                 //metal_printf("%s: op - %s\n", __func__, ggml_op_name(dst->op));
                 //if (src0) {
@@ -994,19 +839,99 @@ void ggml_metal_graph_compute(
     }
 }
 
-bool ggml_backend_metal_map_buffer(
-        struct ggml_backend * backend,
-        const char * name,
-        void * data,
-        size_t   size,
-        size_t   max_size) {
-    return ggml_metal_add_buffer(backend->context, name, data, size, max_size);
-}
-
 static const char * ggml_backend_metal_name(struct ggml_backend * ctx) {
     return "Metal";
 
     UNUSED(ctx);
+}
+
+static void ggml_backend_metal_free(struct ggml_backend * backend) {
+    struct ggml_metal_context * ctx_metal = (struct ggml_metal_context *)backend->context;
+    ggml_metal_free(ctx_metal);
+    free(backend);
+}
+
+static const size_t TENSOR_ALIGNMENT = 128;
+
+struct ggml_metal_buffer_wrapper {
+    id<MTLBuffer> buffer;
+};
+
+static void ggml_backend_metal_free_buffer(struct ggml_backend_buffer * alloc) {
+    struct ggml_metal_buffer_wrapper * wrapper = (struct ggml_metal_buffer_wrapper *)alloc->backend_data;
+    [wrapper->buffer release];
+    free(wrapper);
+}
+
+static struct ggml_backend_buffer * ggml_backend_metal_alloc_buffer(struct ggml_backend * backend, size_t size) {
+    struct ggml_metal_context * ctx_metal = (struct ggml_metal_context *)backend->context;
+
+    struct ggml_metal_buffer_wrapper * wrapper = malloc(sizeof(struct ggml_metal_buffer_wrapper));
+    wrapper->buffer = [ctx_metal->device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+    printf("XXXXXXXXXXXXXXX ALOC: %p %p\n", (void * )wrapper, (void *)&wrapper->buffer);
+
+    struct ggml_backend_buffer * buffer = ggml_allocator_simple_init(wrapper, size, TENSOR_ALIGNMENT);
+    buffer->interface.free_data = ggml_backend_metal_free_buffer;
+    buffer->backend_data = wrapper; // GG: why assign to backend_data? Can't we do it in the allocator?
+
+    return buffer;
+}
+
+static void ggml_backend_metal_set_tensor_async(struct ggml_backend * backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+
+    struct ggml_backend_buffer * bb = (struct ggml_backend_buffer *)tensor->data;
+    struct ggml_metal_buffer_wrapper * wrapper = (struct ggml_metal_buffer_wrapper *)bb->backend_data;
+
+    printf("XXXXXXXXXXXXXXX SET : %p\n", (void *)wrapper);
+
+    char * contents = [wrapper->buffer contents];
+    memcpy((char *)contents + offset, data, size);
+
+    UNUSED(backend);
+}
+
+static void ggml_backend_metal_get_tensor_async(struct ggml_backend * backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+
+    struct ggml_metal_buffer_wrapper * wrapper = (struct ggml_metal_buffer_wrapper *)data;
+
+    printf("XXXXXXXXXXXXXXX GET : %p\n", (void *)wrapper);
+
+    char * contents = [wrapper->buffer contents];
+    memcpy(contents, (const char *)tensor->data + offset, size);
+
+    UNUSED(backend);
+}
+
+static void ggml_backend_metal_synchronize(struct ggml_backend * backend) {
+    UNUSED(backend);
+}
+
+static ggml_graph_plan_t ggml_backend_metal_graph_plan_create(struct ggml_backend * backend, struct ggml_cgraph * cgraph) {
+    GGML_ASSERT(false);
+
+    return NULL;
+
+    UNUSED(backend);
+    UNUSED(cgraph);
+}
+
+static void ggml_backend_metal_graph_plan_free(struct ggml_backend * backend, ggml_graph_plan_t plan) {
+    GGML_ASSERT(false);
+
+    UNUSED(backend);
+    UNUSED(plan);
+}
+
+static void ggml_backend_metal_graph_plan_compute(struct ggml_backend * backend, ggml_graph_plan_t plan) {
+    GGML_ASSERT(false);
+
+    UNUSED(backend);
+    UNUSED(plan);
 }
 
 static void ggml_backend_metal_graph_compute(struct ggml_backend * backend, struct ggml_cgraph * cgraph) {
@@ -1015,40 +940,28 @@ static void ggml_backend_metal_graph_compute(struct ggml_backend * backend, stru
 
 static struct ggml_backend_interface metal_backend_interface = {
     /* .get_name            = */ ggml_backend_metal_name,
-    /* .free                = */ NULL, //ggml_backend_metal_alloc_buffer,
-    /* .alloc_buffer        = */ NULL, //ggml_backend_metal_free_buffer,
-    /* .set_tensor_async    = */ NULL, //ggml_backend_metal_reset_buffer,
-    /* .get_tensor_async    = */ NULL, //ggml_backend_metal_alloc_tensor,
-    /* .synchronize         = */ NULL, //ggml_backend_metal_set_tensor_async,
+    /* .free                = */ ggml_backend_metal_free,
+    /* .alloc_buffer        = */ ggml_backend_metal_alloc_buffer,
+    /* .set_tensor_async    = */ ggml_backend_metal_set_tensor_async,
+    /* .get_tensor_async    = */ ggml_backend_metal_get_tensor_async,
+    /* .synchronize         = */ ggml_backend_metal_synchronize,
     /* .cpy_tensor_from     = */ NULL, //ggml_backend_metal_get_tensor_async,
     /* .cpy_tensor_to       = */ NULL, //ggml_backend_metal_synchronize,
-    /* .graph_plan_create   = */ NULL, //nullptr,
-    /* .graph_plan_free     = */ NULL, //nullptr,
-    /* .graph_plan_compute  = */ NULL, //ggml_backend_metal_graph_plan_create,
+    /* .graph_plan_create   = */ ggml_backend_metal_graph_plan_create,
+    /* .graph_plan_free     = */ ggml_backend_metal_graph_plan_free,
+    /* .graph_plan_compute  = */ ggml_backend_metal_graph_plan_compute,
     /* .graph_compute       = */ ggml_backend_metal_graph_compute,
 };
 
-struct ggml_backend * ggml_backend_metal_init(struct ggml_backend * backend_cpu) {
-    struct ggml_metal_context * ctx = ggml_metal_init(8);
+struct ggml_backend * ggml_backend_metal_init(void) {
+    struct ggml_metal_context * ctx = ggml_metal_init(1);
 
     struct ggml_backend * backend_metal = malloc(sizeof(struct ggml_backend));
     *backend_metal = (struct ggml_backend){
         /* .interface     = */ metal_backend_interface,
         /* .context       = */ ctx,
-        /* .is_ram_shared = */ true,
+        /* .is_ram_shared = */ false,
     };
-
-    // reuses CPU calls for now
-    backend_metal->interface.free               = backend_cpu->interface.free;
-    backend_metal->interface.alloc_buffer       = backend_cpu->interface.alloc_buffer;
-    backend_metal->interface.set_tensor_async   = backend_cpu->interface.set_tensor_async;
-    backend_metal->interface.get_tensor_async   = backend_cpu->interface.get_tensor_async;
-    backend_metal->interface.synchronize        = backend_cpu->interface.synchronize;
-    backend_metal->interface.cpy_tensor_from    = backend_cpu->interface.cpy_tensor_from;
-    backend_metal->interface.cpy_tensor_to      = backend_cpu->interface.cpy_tensor_to;
-    backend_metal->interface.graph_plan_create  = backend_cpu->interface.graph_plan_create;
-    backend_metal->interface.graph_plan_free    = backend_cpu->interface.graph_plan_free;
-    backend_metal->interface.graph_plan_compute = backend_cpu->interface.graph_plan_compute;
 
     return backend_metal;
 }
